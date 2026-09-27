@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "f=\"${CLAUDE_FIGHTER_STATE:-/dev/null}\"; cat >> \"$f\"; echo >> \"$f\"" }] }]
+  }
+}

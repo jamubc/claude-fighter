@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""claude-fighter (python renderer): run Claude Code through a PTY; when the
+window gets thin, swap the TUI for a stage where the Claude mascot punches a
+crate while working, and meditates in a forest under the sky when the turn is done.
+
+State comes from Claude Code hooks (../hooks), art from ../sprites/sprites.json.
+
+  claude-fighter [--width N] [--demo] [--log FILE] [-- command args...]
+"""
+import argparse, fcntl, json, os, pty, random, re, select, signal, struct, sys, termios, time, tty
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOOKS = os.path.join(ROOT, "hooks", "settings.json")
+with open(os.path.join(ROOT, "sprites", "sprites.json")) as f:
+    ART = json.load(f)
+TEXT, COLORS = ART["text"], ART["colors"]
+RST = "\x1b[0m"
+ANSI = re.compile(rb"\x1b(\[[0-9;?<>=]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|.)")
+NUMBER = re.compile(rb"(?<![\w.])\d(?:[\d.,]{0,5}\d)?[a-z%]{0,2}(?!\w)")
+
+# hook_event_name -> state (see hooks/README.md)
+EVENT_STATE = {
+    "SessionStart": "idle", "UserPromptSubmit": "fight", "PreToolUse": "fight",
+    "PostToolUse": "fight", "Notification": "waiting", "PermissionRequest": "waiting",
+    "Stop": "peace", "SubagentStop": "fight",
+}
+LOG = None  # --log FILE: append every hook event here (debugging); off by default
+
+
+def sgr(name):
+    return f"\x1b[{COLORS[name]}m" if name else ""
+
+
+def sprite(group, name, tick):
+    s = ART[group][name]
+    return s["frames"][(tick // s["rate"]) % len(s["frames"])], sgr(s["color"])
+
+
+def term_size(fd):
+    try:
+        rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        return rows or 24, cols or 80
+    except OSError:
+        return 24, 80
+
+
+def set_size(fd, rows, cols):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+class Canvas:
+    def __init__(self, rows, cols):
+        self.rows, self.cols = rows, cols
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.color = [[""] * cols for _ in range(rows)]
+
+    def put(self, r, c, s, color="", skip_space=False):
+        for i, ch in enumerate(s):
+            if 0 <= r < self.rows and 0 <= c + i < self.cols and not (skip_space and ch == " "):
+                self.grid[r][c + i], self.color[r][c + i] = ch, color
+
+    def center(self, r, s, color=""):
+        self.put(r, max(0, (self.cols - len(s)) // 2), s[: self.cols], color)
+
+    def render(self):
+        out = ["\x1b[H"]
+        for r in range(self.rows):
+            cur = None
+            for c in range(self.cols):
+                if self.color[r][c] != cur:
+                    cur = self.color[r][c]
+                    out.append(RST + cur)
+                out.append(self.grid[r][c])
+            out.append(RST + ("\r\n" if r < self.rows - 1 else ""))
+        return "".join(out)
+
+
+class Stage:
+    """Draws one scene per tick. Every scene keeps a one-row margin top and bottom and a one-column
+    margin left/right on text rows so rounded terminal corners never hide anything."""
+
+    def __init__(self):
+        self.t, self.x, self.hp, self.shake = 0, 0, 100, 0
+        self.pops = []  # floating sound words: {text, x, y, ttl}
+        self.debris = []  # crate splinters: {x, y, vx, vy, ch, ttl}
+        self.sparks = []  # {x, y, ttl}
+        self.ko = 0  # ticks left in the knock-out / respawn sequence
+        self.state = "idle"
+        self.tool = None  # tool currently running (PreToolUse seen, PostToolUse not yet)
+        self.hits = []  # finished tools whose punch hasn't landed yet
+        self.last = "no hook events yet"
+        self.numbers = []  # recent numbers seen in Claude's output: shadow-boxing opponents
+        self.incoming = []  # numbers flying at Claude: {text, side, row, x, ttl}
+        self.swing = None  # (side, row, ticks) of the jab being thrown
+
+    def feed(self, data):
+        """Sample numbers from Claude's terminal output; escape codes are stripped first."""
+        for m in NUMBER.findall(ANSI.sub(b" ", data)):
+            if random.random() < 0.3:
+                self.numbers = (self.numbers + [m.decode()])[-12:]
+
+    def on_event(self, ev):
+        name = ev.get("hook_event_name")
+        self.last = f"{name} {ev.get('tool_name') or ''}".strip()
+        if LOG:
+            with open(LOG, "a") as f:
+                f.write(json.dumps(ev) + "\n")
+        if name not in EVENT_STATE:
+            return  # events we don't map (PreCompact, SubagentStart, ...) keep the current scene
+        self.state = EVENT_STATE[name]
+        if name == "PreToolUse":
+            self.tool = ev.get("tool_name") or "tool"
+        else:
+            if name == "PostToolUse":
+                self.hits.append(ev.get("tool_name") or self.tool or "tool")
+            self.tool = None
+        if self.state != "fight":
+            self.x, self.hp, self.ko, self.hits, self.incoming = 0, 100, 0, [], []
+            self.pops, self.debris, self.sparks = [], [], []
+
+    def frame(self, rows, cols):
+        self.t += 1
+        cv = Canvas(rows, cols)
+        if rows < 8 or cols < 22:
+            self.tiny(cv)
+        else:
+            {"fight": self.fight, "peace": self.peace}.get(self.state, self.stand)(cv)
+        return cv.render()
+
+    # -- shared pieces -------------------------------------------------------------------------
+
+    def footer(self, cv, text):
+        r = cv.rows - 2  # last row is margin
+        cv.put(r, 1, text[: cv.cols - 2], sgr("dim"))
+        if cv.cols - 2 >= len(text) + len(self.last) + 3:
+            cv.put(r, cv.cols - 1 - len(self.last), self.last, sgr("dim"))
+
+    def floor_row(self, cv):
+        return cv.rows - 3  # footer at rows-2, margin at rows-1
+
+    def spawn_pop(self, text, x, y, cols):
+        self.pops.append({"text": text, "x": max(1, min(cols - 1 - len(text), x)), "y": y, "ttl": 9,
+                          "col": f"\x1b[{random.choice(COLORS['pops'])}m"})
+
+    def draw_pops(self, cv):
+        for p in self.pops:  # sound words float up and flicker
+            cv.put(int(p["y"]), p["x"], p["text"], sgr("flash") if p["ttl"] % 2 else p["col"])
+            p["y"] -= 0.5
+            p["ttl"] -= 1
+        self.pops = [p for p in self.pops if p["ttl"] > 0 and p["y"] >= 2]
+
+    def draw_debris(self, cv):
+        for d in self.debris:
+            cv.put(int(d["y"]), int(d["x"]), d["ch"], sgr("wood") if d["ttl"] > 3 else sgr("wood_dark"))
+            d["x"] += d["vx"]
+            d["vy"] += 0.35
+            d["y"] += d["vy"]
+            d["ttl"] -= 1
+        self.debris = [d for d in self.debris if d["ttl"] > 0 and 2 <= d["y"] <= self.floor_row(cv) - 1]
+
+    def draw_sparks(self, cv):
+        for sp in self.sparks:
+            cv.put(sp["y"], sp["x"], "✶" if sp["ttl"] > 1 else "✧", sgr("flash"))
+            sp["ttl"] -= 1
+        self.sparks = [sp for sp in self.sparks if sp["ttl"] > 0]
+
+    # -- tiny window ---------------------------------------------------------------------------
+
+    def tiny(self, cv):
+        """Too small for a stage: Claude's face and one word, still doing its thing."""
+        rows, cols = cv.rows, cv.cols
+        if rows >= 3 and cols >= 5:
+            frames, col = sprite("hero", "tiny", self.t)
+            mx, my = (cols - 5) // 2, max(0, (rows - 3) // 2)
+            for i, line in enumerate(frames):
+                cv.put(my + i, mx, line, col)
+            words = TEXT["tiny"].get(self.state, TEXT["tiny"]["idle"])
+            word = words[(self.t // 8) % len(words)]
+            if self.state == "fight" and self.t % 8 < 4:
+                word = " " * len(word)  # flash
+            if rows >= 4 and cols >= len(word) + 2:
+                cv.center(my + 2, word, sgr("flash") if self.state == "fight" else sgr("dim"))
+        elif rows >= 1 and cols >= 1:
+            cv.center(rows // 2, "✶" if self.t % 6 < 3 else "✧", sgr("orange"))
+
+    # -- idle / waiting ------------------------------------------------------------------------
+
+    def stand(self, cv):
+        floor = self.floor_row(cv)
+        pose = "waiting" if self.state == "waiting" else "idle"
+        frames, col = sprite("hero", pose, self.t)
+        hx = 2
+        for i, line in enumerate(frames):
+            cv.put(floor - len(frames) + i, hx, line, col)
+        if self.state == "waiting" and floor - len(frames) - 1 >= 1:
+            cv.put(floor - len(frames) - 1, hx + 4, TEXT["title_wait"][: cv.cols - hx - 5], sgr("yellow"))
+        cv.put(floor, 0, "▔" * cv.cols, sgr("dim"))
+        self.footer(cv, TEXT["footer"])
+
+    # -- fight ---------------------------------------------------------------------------------
+
+    def fight(self, cv):
+        rows, cols, dim = cv.rows, cv.cols, sgr("dim")
+        floor = self.floor_row(cv)
+        crate_w = 7
+        ex = cols - crate_w - 1  # crate x; 1 col margin on the right
+        reach = ex - 11
+        frames, col = sprite("hero", "guard", self.t)
+        hit_tick = False
+        if self.ko:
+            self.ko -= 1
+            self.x = max(0, self.x - 1)  # step back and admire
+            if self.ko == 0:
+                self.hp = 100
+                self.shake = 2
+                self.spawn_pop(TEXT["thud"], ex - 2, floor - 5, cols)
+        elif self.tool or self.hits:
+            # A tool running or a hit still owed: rush the crate and punch.
+            self.incoming, self.swing = [], None
+            self.x = min(reach, self.x + 2)
+            if self.x >= reach - 1:
+                frames, col = sprite("hero", "punch", self.t)
+                if self.hits and self.t % 3 == 0:
+                    tool = self.hits.pop(0)
+                    hit_tick = True
+                    self.hp -= random.randint(6, 14)
+                    self.shake = 2
+                    word = f"{tool}!" if random.random() < 0.5 else random.choice(TEXT["hits"])
+                    self.spawn_pop(word, ex - 1, floor - 4, cols)
+                    self.sparks.append({"x": ex, "y": floor - 2, "ttl": 2})
+                    for _ in range(3):
+                        self.debris.append({"x": ex + random.randint(0, crate_w - 1), "y": floor - 3.0,
+                                            "vx": random.uniform(-1.5, 1.5), "vy": random.uniform(-1.6, -0.6),
+                                            "ch": random.choice("▪▫╲╱˙"), "ttl": 8})
+                    if self.hp <= 0:
+                        self.hp = 0
+                        self.ko = 18
+                        self.spawn_pop(TEXT["ko"], ex - 3, floor - 5, cols)
+                        for _ in range(14):
+                            self.debris.append({"x": ex + random.randint(0, crate_w - 1), "y": floor - random.uniform(1, 3),
+                                                "vx": random.uniform(-2.5, 2.5), "vy": random.uniform(-2.2, -0.4),
+                                                "ch": random.choice("┏┓┗┛━┃▒╲╱"), "ttl": 10})
+        else:
+            # Claude is thinking: back at home, shadow-boxing numbers from its own output.
+            home = reach // 2
+            self.x += (self.x < home) - (self.x > home)
+            frames = self.shadowbox(cols) or frames
+        self.x = max(0, min(self.x, max(0, cols - 12)))
+
+        # Health bar, no label: green -> yellow -> red as the crate wears down.
+        bar_w = cols - 2
+        filled = bar_w * max(0, self.hp) // 100
+        hp_col = sgr("hp_hi" if self.hp > 50 else "hp_mid" if self.hp > 25 else "hp_lo")
+        if self.hp <= 25 and self.t % 6 < 3:
+            hp_col = sgr("flash")  # low health: pulse
+        cv.put(1, 1, "█" * filled, hp_col)
+        cv.put(1, 1 + filled, "░" * (bar_w - filled), dim)
+
+        self.draw_debris(cv)
+        base = floor - len(frames)
+        for i, line in enumerate(frames):
+            cv.put(base + i, self.x, line, col)
+        for n in self.incoming:
+            cv.put(base + n["row"], n["x"], n["text"], dim if n["ttl"] is not None else sgr("cyan"))
+        if self.swing:
+            cv.put(base + self.swing[1], self.x + (12 if self.swing[0] > 0 else 0), "✶", sgr("yellow"))
+
+        # The crate: cracks with damage, squashes and flashes on impact, gone while K.O.'d,
+        # then drops back in from the top.
+        if not self.ko or self.ko <= 8:
+            if self.shake and not self.ko:
+                crate, ccol = sprite("scenery", "squash", 0)
+                cx = ex - 1
+            else:
+                tier = 0 if self.ko or self.hp > 66 else 1 if self.hp > 33 else 2  # a fresh one drops in
+                crate = ART["scenery"]["crate"]["frames"][tier]
+                ccol, cx = sgr("wood"), ex
+            if self.ko:  # falling in: 8 ticks from the top row to the floor
+                drop_y = 2 + (floor - 3 - 2) * (8 - self.ko) // 8
+            else:
+                drop_y = floor - len(crate)
+            if hit_tick:
+                ccol = sgr("flash")
+            elif self.shake:
+                ccol = sgr("red")
+                cx += random.choice((-1, 1))
+            for i, line in enumerate(crate):
+                cv.put(drop_y + i, cx, line, ccol)
+            if not (hit_tick or self.shake) and len(crate) == 3:  # darker planks inside the frame
+                cv.put(drop_y + 1, cx + 1, crate[1][1:-1], sgr("wood_dark"))
+        self.shake = max(0, self.shake - 1)
+        cv.put(floor, 0, "▔" * cols, dim)
+        self.draw_sparks(cv)
+        self.draw_pops(cv)
+        self.footer(cv, TEXT["footer"])
+
+    def shadowbox(self, cols):
+        """Numbers fly in from either side, Claude can't tell which; it jabs whichever gets close.
+        Returns the frame to draw, or None for the plain guard."""
+        if self.numbers and len(self.incoming) < 2 and random.random() < 0.08:
+            side = random.choice((-1, 1))  # -1: from the left, 1: from the right
+            text = self.numbers.pop(random.randrange(len(self.numbers)))
+            self.incoming.append({"text": text, "side": side, "row": random.randint(1, 2),
+                                  "x": -len(text) if side < 0 else cols, "ttl": None})
+        for n in self.incoming:
+            if n["ttl"] is not None:  # knocked away: fly back out, fading
+                n["x"] += 2 * n["side"]
+                n["ttl"] -= 1
+                continue
+            n["x"] -= n["side"]
+            fist = self.x + (11 if n["side"] > 0 else 1)
+            edge = n["x"] if n["side"] > 0 else n["x"] + len(n["text"]) - 1
+            if abs(edge - fist) <= 1 or (edge - fist) * n["side"] < 0:  # close, or slipped past
+                n["ttl"], self.swing = 6, (n["side"], n["row"], 3)
+        self.incoming = [n for n in self.incoming if n["ttl"] is None or n["ttl"] > 0]
+        if self.swing:
+            side, row, ticks = self.swing
+            self.swing = (side, row, ticks - 1) if ticks > 1 else None
+            return ART["hero"]["jab_right" if side > 0 else "jab_left"]["frames"][row - 1]
+        if not self.incoming:
+            return sprite("hero", "shadowbox", self.t)[0]
+        return None
+
+    # -- peace ---------------------------------------------------------------------------------
+
+    def peace(self, cv):
+        rows, cols = cv.rows, cv.cols
+        floor = self.floor_row(cv)
+        tree_h = len(ART["scenery"]["tree"]["frames"][0])
+        far_top = floor - 5 - len(ART["scenery"]["tree_far"]["frames"][0])
+        show_far = far_top >= 1
+        # Sky: every row from the top margin down to the near canopy, in a smooth gradient that
+        # runs on behind the far treeline. More height -> stars, clouds, the odd bird.
+        sky_rows = list(range(1, floor - tree_h))
+        bands, n = COLORS["sky"], len(range(1, floor - tree_h))
+        band_of = {}
+        for i, r in enumerate(sky_rows):
+            k = len(bands) - n + i if n < len(bands) else i * len(bands) // n
+            band_of[r] = bands[max(0, min(len(bands) - 1, k))]
+            cv.put(r, 0, " " * cols, f"\x1b[48;5;{band_of[r]}m")
+        on_sky = lambda r, fg: f"\x1b[48;5;{band_of[r]};{fg}m" if r in band_of else f"\x1b[{fg}m"
+        rng = random.Random(cols * 7919 + rows)  # fixed per window size so the layout doesn't jitter
+        if n >= 4:  # stars in the dark upper third, twinkling out of step
+            for _ in range(cols // 6):
+                r, x, phase = sky_rows[rng.randrange(max(1, n // 3))], rng.randrange(cols), rng.randrange(20)
+                ch = "✦" if (self.t + phase) % 20 < 4 else "✧" if (self.t + phase) % 20 < 12 else "˖"
+                cv.put(r, x, ch, on_sky(r, COLORS["star"]))
+        if n >= 3:  # clouds: mixed sizes, own rows and speeds, drifting right
+            shapes = ART["scenery"]["cloud"]["frames"]
+            for _ in range(1 if n < 5 else 2 if n < 8 else 3 if n < 12 else 4):
+                cloud = rng.choice([c for c in shapes if len(c) < n - 1] or shapes[-1:])
+                r = sky_rows[rng.randrange(1, max(2, n - len(cloud)))]
+                speed, off, span = rng.choice((5, 7, 9, 12)), rng.randrange(cols), cols + len(cloud[0]) + 10
+                x = (self.t // speed + off) % span - len(cloud[0]) - 5
+                for i, line in enumerate(cloud):
+                    cv.put(r + i, x, line, on_sky(r + i, COLORS["cloud"]), skip_space=True)
+        if n >= 6:  # a pair of birds now and then: fly across, then rest a while
+            k = self.t % (2 * (cols + 66))
+            if k < cols + 6:
+                bird, _ = sprite("scenery", "bird", self.t)
+                r, x = sky_rows[n // 2], cols - 1 - k
+                cv.put(r, x, bird[0], on_sky(r, COLORS["bird"]))
+                cv.put(r - 1, x + 3, bird[0], on_sky(r - 1, COLORS["bird"]))
+        # Painter's order, back to front; spaces are transparent so each layer shows through.
+        for tx in range(-6, cols if show_far else 0, 6):  # far treeline: smaller, darker, higher up
+            frames, col = sprite("scenery", "tree_far", self.t + tx + 4)
+            for i, line in enumerate(frames):
+                cv.put(far_top + i, tx, line, on_sky(far_top + i, COLORS["fargreen"]), skip_space=True)
+        for tx in range(-2, cols, 9):
+            frames, col = sprite("scenery", "tree", self.t + tx)
+            for i, line in enumerate(frames):
+                cv.put(floor - tree_h + i, tx, line, col if i < tree_h - 2 else sgr("brown"), skip_space=True)
+        hero, hcol = sprite("hero", "meditate", self.t)
+        mx = max(0, (cols - len(hero[0])) // 2)
+        for i, line in enumerate(hero):
+            cv.put(floor - len(hero) + i, mx, line, hcol, skip_space=True)
+        cv.put(floor, 0, "▔" * cols, sgr("green"))
+        for gx in range(rng.randrange(3), cols, rng.choice((5, 7, 8))):  # grass tufts along the floor
+            cv.put(floor, gx, "ʷ" if (self.t // 4 + gx) % 5 else "▔", sgr("green"))
+        if far_top > 1:  # room for the title in the sky; it breathes with the meditation
+            cv.center(1, TEXT["title_peace"], on_sky(1, "1;38;5;255" if (self.t // 15) % 2 else "38;5;250"))
+        self.footer(cv, TEXT["footer_peace"])
+
+
+DEMO_SCRIPT = [  # (seconds, fake hook event) — cycles
+    (2, {"hook_event_name": "SessionStart"}),
+    (3, {"hook_event_name": "UserPromptSubmit"}),
+    (3, {"hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+    (1, {"hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+    (2, {"hook_event_name": "PreToolUse", "tool_name": "Edit"}),
+    (1, {"hook_event_name": "PostToolUse", "tool_name": "Edit"}),
+    (1, {"hook_event_name": "PreToolUse", "tool_name": "Read"}),
+    (1, {"hook_event_name": "PostToolUse", "tool_name": "Read"}),
+    (1, {"hook_event_name": "PreToolUse", "tool_name": "Grep"}),
+    (1, {"hook_event_name": "PostToolUse", "tool_name": "Grep"}),
+    (3, {"hook_event_name": "Notification"}),
+    (6, {"hook_event_name": "Stop"}),
+]
+
+
+def run(cmd, threshold, demo):
+    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
+    state_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"claude-fighter-{os.getpid()}.json")
+    os.environ["CLAUDE_FIGHTER_STATE"] = state_path
+    if cmd[0] == "claude":
+        cmd = cmd[:1] + ["--settings", HOOKS] + cmd[1:]
+    pid, master = (None, None) if demo else pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as e:
+            print(f"claude-fighter: {cmd[0]}: {e}", file=sys.stderr)
+            os._exit(127)
+
+    stage, resized = Stage(), [True]
+    offset, demo_i, demo_at = 0, 0, time.monotonic()
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    for sig in (signal.SIGHUP, signal.SIGTERM):  # window closed / killed: still run cleanup
+        signal.signal(sig, lambda *_: sys.exit(1))
+    next_frame = time.monotonic()
+    old = termios.tcgetattr(stdin)
+    tty.setraw(stdin)
+    narrow = False
+    write = lambda s: os.write(stdout, s.encode() if isinstance(s, str) else s)
+    try:
+        while True:
+            if resized[0]:
+                resized[0] = False
+                rows, cols = term_size(stdout)
+                was, narrow = narrow, demo or cols < threshold
+                if narrow and not was:
+                    write("\x1b[?1049h\x1b[?25l\x1b[2J")
+                elif was and not narrow:
+                    write("\x1b[?25h\x1b[?1049l")
+                if master is not None:
+                    if was and not narrow:  # jiggle size so the child fully redraws
+                        set_size(master, rows, max(1, cols - 1))
+                    set_size(master, rows, cols)
+                    os.kill(pid, signal.SIGWINCH)
+            fds = [stdin] + ([master] if master is not None else [])
+            try:
+                wait = max(0.0, next_frame - time.monotonic()) if narrow else 1.0
+                ready, _, _ = select.select(fds, [], [], wait)
+            except InterruptedError:
+                continue
+            if stdin in ready:
+                data = os.read(stdin, 4096)
+                if demo and (not data or data in (b"q", b"\x03")):
+                    break
+                if master is not None:
+                    os.write(master, data)
+            if master is not None and master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                stage.feed(data)
+                if not narrow:
+                    write(data)
+            # Hook state: either the real file or the demo script.
+            if demo:
+                if time.monotonic() - demo_at > DEMO_SCRIPT[demo_i][0]:
+                    demo_i, demo_at = (demo_i + 1) % len(DEMO_SCRIPT), time.monotonic()
+                    stage.on_event(DEMO_SCRIPT[demo_i][1])
+                    stage.feed(b" ".join(str(random.randint(0, 9999)).encode() for _ in range(8)))
+            else:
+                try:
+                    with open(state_path, "rb") as f:
+                        f.seek(offset)
+                        chunk = f.read()
+                except OSError:
+                    chunk = b""  # not written yet
+                for line in chunk.splitlines(keepends=True):
+                    if not line.endswith(b"\n"):
+                        break  # mid-write; re-read next tick
+                    offset += len(line)
+                    if not line.strip():
+                        continue
+                    try:
+                        stage.on_event(json.loads(line))
+                    except ValueError:
+                        pass
+            # Fixed 10 fps, independent of how often Claude's output wakes the loop.
+            if narrow and time.monotonic() >= next_frame:
+                next_frame = time.monotonic() + 0.1
+                write(stage.frame(*term_size(stdout)))
+    finally:
+        if narrow:
+            write("\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(stdin, termios.TCSADRAIN, old)
+        try:
+            os.unlink(state_path)
+        except OSError:
+            pass
+    if pid:
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--width", type=int, default=int(os.environ.get("CLAUDE_FIGHTER_WIDTH", 50)),
+                   help="show the stage when the window is narrower than this (default 50)")
+    p.add_argument("--demo", action="store_true", help="just show the stage with scripted events (q to quit)")
+    p.add_argument("--log", metavar="FILE", help="append every hook event to FILE (debugging; off by default)")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to wrap (default: claude)")
+    a = p.parse_args()
+    global LOG
+    LOG = a.log
+    cmd = [c for c in a.cmd if c != "--"] or ["claude"]
+    sys.exit(run(cmd, a.width, a.demo))
+
+
+if __name__ == "__main__":
+    main()
